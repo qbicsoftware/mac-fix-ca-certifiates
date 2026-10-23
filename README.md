@@ -53,8 +53,10 @@ covered:
 | `/usr/bin/curl`, `git`, `perl`, `ruby`, `openssl`, built-in `python3` | `/etc/ssl/cert.pem` | **trusts the compromised chains** |
 | `pip` and virtualenvs | bundled `certifi` / `PIP_CERT` | **trusts the compromised chains** |
 | every conda environment | per-env `certifi` + `ssl/cacert.pem` | **trusts the compromised chains** |
+| every JDK | per-JDK `lib/security/cacerts` | **trusts the compromised chains** — see [Java runtimes](#java-runtimes) |
 
-`fix-certificates.sh` assesses all of those and then fixes them.
+`fix-certificates.sh` assesses and fixes all of those except Java; JDKs need
+[`emudhra-check.sh`](#java-runtimes).
 
 ## Usage
 
@@ -237,6 +239,40 @@ the result looks wrong.
 4. **Re-verification** — the whole assessment runs again and the exit code
    reflects the final state.
 
+## Java runtimes
+
+`fix-certificates.sh` does **not** cover Java. A JDK ignores `/etc/ssl/cert.pem`,
+the keychain and conda's certifi entirely: every JDK ships its own trust store
+(`lib/security/cacerts`) and its own blocklist, so a stock JDK still accepts the
+compromised chains even after the fixes above.
+
+Audit every JDK on the machine (system installers, SDKMAN, Homebrew, jenv, asdf,
+mise) with the bundled checker:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
+bash emudhra-check.sh              # read-only audit
+bash emudhra-check.sh --inventory  # list JDKs and versions only
+```
+
+It prints one line per JDK — e.g. `AFFECTED 24 (OpenJDK) 12 of 12 compromised
+chains trusted` — and exits `1` when anything is affected. Then update each
+affected JDK to a fixed build:
+
+| JDK | Fixed build |
+| --- | --- |
+| 27 | 27.0.1.0.2 |
+| 25 | 25.0.5.0.2 |
+| 21 | 21.0.13.0.2 |
+| 17 | 17.0.21.0.2 |
+| 11 | 11.0.33.0.2 |
+| 8 | 8u511 |
+
+JDK 23 and 24 are end-of-life and will not get a fix — move to a patched LTS. If
+no patched build is available yet, `bash emudhra-check.sh --fix` appends the
+compromised intermediates to each affected JDK's `blocked.certs` as an interim
+measure (it makes a backup first).
+
 ## After running
 
 Open a new shell (and re-activate any conda environments) so running processes
@@ -244,6 +280,7 @@ pick up the new bundles. Browsers and GUI apps use the keychain, which Apple
 already patched — keep macOS up to date rather than relying on this script for
 those.
 
-This script only covers the trust stores listed above. Anything that ships its
-own embedded root store (Docker Desktop, VS Code, Electron apps, language
-runtimes, VPN clients, …) still needs its own update.
+This script only covers the trust stores listed above. Anything else that ships its
+own embedded root store (Docker Desktop, VS Code, Electron apps, non-Java language
+runtimes, VPN clients, …) still needs its own update — and Java is covered
+separately by `emudhra-check.sh`, see [Java runtimes](#java-runtimes).
