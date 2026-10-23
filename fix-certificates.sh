@@ -1077,6 +1077,56 @@ $envs
 EOF
 }
 
+# offer_backup <fix|clean>
+# Asks whether to snapshot every trust store. Recommended, defaults to yes.
+# In "clean" mode (nothing to fix) an unattended run does not snapshot, so a
+# repeated `apply --yes` cannot pile up backups. Returns 0 if a snapshot was
+# taken (or would be, under --dry-run).
+offer_backup() {
+    local mode="${1:-fix}" do_snapshot=1 reply
+
+    if [ "$DO_BACKUP" -eq 0 ]; then
+        [ "$mode" = "fix" ] && note "--no-backup given: skipping the full snapshot"
+        return 1
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        note "a normal run would offer to back up every trust store (default: yes)"
+        return 0
+    fi
+
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        [ "$mode" = "clean" ] && return 1
+    else
+        if [ "$mode" = "clean" ]; then
+            printf '\n  %sRecommended:%s keep a snapshot of every trust store.\n' \
+                "$C_GREEN" "$C_RESET"
+        else
+            printf '\n  %sRecommended:%s back up every trust store before changing anything.\n' \
+                "$C_GREEN" "$C_RESET"
+        fi
+        printf '  Back up all trust stores now? [Y/n] '
+        read -r reply
+        case "$reply" in
+            n|N|no|NO|never) do_snapshot=0 ;;
+        esac
+    fi
+
+    if [ "$do_snapshot" -eq 1 ]; then
+        hdr "Backup"
+        do_snapshot_all
+        if [ "$BACKUPS_FAILED" -gt 0 ]; then
+            warn "$BACKUPS_FAILED trust store(s) could not be backed up"
+        fi
+        ok "$BACKUPS_MADE trust store(s) backed up"
+        return 0
+    fi
+
+    if [ "$mode" = "fix" ]; then
+        note "no full snapshot taken; a verified backup is still written before every single file that is modified"
+    fi
+    return 1
+}
+
 # -----------------------------------------------------------------------------
 # REPORT
 # -----------------------------------------------------------------------------
@@ -1326,6 +1376,15 @@ main() {
     if [ "$affected" -eq 0 ]; then
         print_summary
         printf '\n%sNothing to fix.%s\n' "$C_GREEN" "$C_RESET"
+        # apply still offers a snapshot on a clean host, when someone is there
+        # to answer. Unattended runs stay silent so they cannot pile up .bak
+        # files on every invocation.
+        if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+            offer_backup clean
+            printf '\n'
+        else
+            note "run '$SELF backup' to snapshot every trust store"
+        fi
         exit 0
     fi
 
@@ -1333,7 +1392,8 @@ main() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         warn "dry run: no changes will be made"
-        note "a normal run would offer to back up all trust stores first (default: yes)"
+        print_affected_targets
+        offer_backup fix
     else
         print_affected_targets
 
@@ -1343,32 +1403,7 @@ main() {
             exit 2
         fi
 
-        # ---- backup prompt, recommended and defaulting to yes ----
-        local do_snapshot=1
-        if [ "$DO_BACKUP" -eq 0 ]; then
-            do_snapshot=0
-            note "--no-backup given: skipping the full snapshot"
-        elif [ "$ASSUME_YES" -eq 0 ]; then
-            printf '\n  %sRecommended:%s back up every trust store before changing anything.\n' \
-                "$C_GREEN" "$C_RESET"
-            printf '  Back up all trust stores now? [Y/n] '
-            read -r reply
-            case "$reply" in
-                n|N|no|NO|never) do_snapshot=0 ;;
-                *) do_snapshot=1 ;;
-            esac
-        fi
-
-        if [ "$do_snapshot" -eq 1 ]; then
-            hdr "Backup"
-            do_snapshot_all
-            if [ "$BACKUPS_FAILED" -gt 0 ]; then
-                warn "$BACKUPS_FAILED trust store(s) could not be backed up"
-            fi
-            ok "$BACKUPS_MADE trust store(s) backed up"
-        else
-            note "no full snapshot taken; a verified backup is still written before every single file that is modified"
-        fi
+        offer_backup fix
 
         # ---- go / no-go ----
         if [ "$ASSUME_YES" -eq 0 ]; then

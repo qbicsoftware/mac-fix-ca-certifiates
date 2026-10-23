@@ -79,6 +79,10 @@ is **yes**, so just press Enter. This snapshots `/etc/ssl/cert.pem` and every
 conda environment bundle before any change is made.
 2. **Apply the fixes now? [Y/n]** - defaults to **yes**.
 
+If nothing is affected, `apply` says so and then still offers the snapshot
+(unattended runs stay silent and just point at `backup`, so a repeated
+`apply --yes` cannot pile up `.bak` files).
+
 Both questions are skipped for unattended runs: `--yes` answers yes to both,
 `--no-backup` skips the snapshot (a verified per-file backup is still written
 before every single file is modified), and `--dry-run` changes nothing at all.
