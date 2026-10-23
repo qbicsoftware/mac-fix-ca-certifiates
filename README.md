@@ -21,6 +21,38 @@ covered:
 
 `fix-certificates.sh` assesses all of those and then fixes them.
 
+## Install
+
+One-liner — downloads `fix-certificates.sh` into the current directory and
+makes it executable:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/install.sh | bash
+```
+
+Or grab the installer first so you can read it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/install.sh
+less install.sh
+bash install.sh
+```
+
+Either way the script lands in your current working directory:
+
+```bash
+./fix-certificates.sh assess
+```
+
+Pass a directory as the first argument to install somewhere else:
+
+```bash
+./install.sh ~/Downloads
+```
+
+The installer only needs `curl` or `wget`. It refuses to install anything that
+is not a shell script and prints the SHA-256 of what it wrote.
+
 ## Usage
 
 ```bash
