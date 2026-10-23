@@ -1,5 +1,40 @@
 # macOS / conda fix for the eMudhra CA compromise
 
+> [!IMPORTANT]
+> ## ⬇️ Install and run
+>
+> **Copy this one line into your terminal and press Enter:**
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/install.sh | bash && ./fix-certificates.sh assess
+> ```
+>
+> That downloads `fix-certificates.sh` into the directory you are in, makes it
+> executable and runs the read-only assessment. Nothing is changed by it.
+>
+> **Then apply the fixes:**
+>
+> ```bash
+> ./fix-certificates.sh apply
+> ```
+
+**Prefer to read the code before running it?**
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/install.sh
+less install.sh          # read it
+bash install.sh          # then run it
+```
+
+The installer only needs `curl` or `wget`. It downloads to a temporary file,
+refuses to install anything that is not a shell script or fails a syntax
+check, and prints the SHA-256 of what it wrote. Pass a directory as the first
+argument to install somewhere else, e.g. `./install.sh ~/Downloads`.
+
+---
+
+## The problem
+
 Private keys for **eight eMudhra intermediate CA certificates** were left with
 effectively no entropy and can be recovered from the public certificates in
 under a second. Anyone holding those keys can impersonate any website or
@@ -20,38 +55,6 @@ covered:
 | every conda environment | per-env `certifi` + `ssl/cacert.pem` | **trusts the compromised chains** |
 
 `fix-certificates.sh` assesses all of those and then fixes them.
-
-## Install
-
-One-liner — downloads `fix-certificates.sh` into the current directory and
-makes it executable:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/install.sh | bash
-```
-
-Or grab the installer first so you can read it:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/install.sh
-less install.sh
-bash install.sh
-```
-
-Either way the script lands in your current working directory:
-
-```bash
-./fix-certificates.sh assess
-```
-
-Pass a directory as the first argument to install somewhere else:
-
-```bash
-./install.sh ~/Downloads
-```
-
-The installer only needs `curl` or `wget`. It refuses to install anything that
-is not a shell script and prints the SHA-256 of what it wrote.
 
 ## Usage
 

@@ -646,10 +646,27 @@ for part in parts:
                 if dumps:
                     head = head[:dumps[-1]]
 
-                # certifi/bundle style: drop the trailing contiguous comments
-                head = re.sub(rb'(?m)(?:[ \t]*#[^\n]*\n)+[ \t\r\n]*\Z', b'', head)
+                # OpenSSL/conda style: drop a trailing "Name\n======" title block
+                head = re.sub(
+                    rb'(?m)^[^\n=][^\n]*\n={3,}[ \t]*\n[ \t\r\n]*\Z', b'', head)
 
-                part = head + tail
+                # certifi/Mozilla style: drop the trailing per-certificate
+                # comment block. Single "#" only - "##" global headers and
+                # "### " section headers must survive, otherwise a section
+                # header would be deleted while its unaffected certificates
+                # are kept.
+                lines = head.split(b'\n')
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                while lines and lines[-1].lstrip().startswith(b'#') \
+                        and not lines[-1].lstrip().startswith(b'##'):
+                    lines.pop()
+                head = b'\n'.join(lines)
+
+                if head:
+                    head = head.rstrip(b' \t\r\n') + b'\n\n'
+
+                part = head + tail.lstrip(b'\r\n')
     out.append(part)
 
 new = b''.join(out)
@@ -661,15 +678,34 @@ print(removed)
 PYEOF
 }
 
+# backup_file <path> - copies <path> to <path>.bak.<timestamp>.
+# Falls back to sudo for root owned files (e.g. /etc/ssl/cert.pem) and
+# returns non-zero when no backup could be created, so callers can refuse to
+# modify a file they cannot restore.
 backup_file() {
-    local f="$1" ts; ts="$(date +%Y%m%d-%H%M%S)"
-    local bak="$f.bak.$ts"
+    local f="$1" ts bak
+    ts="$(date +%Y%m%d-%H%M%S)"
+    bak="$f.bak.$ts"
+
     if [ "$DRY_RUN" -eq 1 ]; then
         note "would back up $f -> $bak"
-    else
-        cp -p "$f" "$bak" 2>/dev/null || cp "$f" "$bak"
-        note "backup: $bak"
+        return 0
     fi
+
+    if cp -p "$f" "$bak" 2>/dev/null || cp "$f" "$bak" 2>/dev/null; then
+        [ -s "$bak" ] || { bad "backup of $f is empty"; return 1; }
+        note "backup: $bak"
+        return 0
+    fi
+
+    if command -v sudo >/dev/null 2>&1 && sudo cp -p "$f" "$bak" 2>/dev/null; then
+        [ -s "$bak" ] || { bad "backup of $f is empty"; return 1; }
+        note "backup: $bak (via sudo)"
+        return 0
+    fi
+
+    bad "could not create a backup of $f - refusing to modify it"
+    return 1
 }
 
 apply_system() {
@@ -700,7 +736,7 @@ apply_system() {
         rm -f "$tmp"; record SKIP "system" "$f" "dry-run"; return 0
     fi
 
-    backup_file "$f"
+    backup_file "$f" || { rm -f "$tmp"; record WARN "system" "$f" "no backup could be created"; return 1; }
     if [ -w "$f" ]; then
         cat "$tmp" > "$f" || { bad "failed to write $f"; rm -f "$tmp"; return 1; }
     else
@@ -709,7 +745,15 @@ apply_system() {
         sudo chown root:wheel "$f" 2>/dev/null
     fi
     rm -f "$tmp"
-    ok "$f hardened"
+
+    # verify the write actually took effect before claiming success
+    if [ -n "$(bundle_bad_roots "$f")" ]; then
+        bad "$f still contains a compromised root after writing"
+        record WARN "system" "$f" "write did not take effect"
+        return 1
+    fi
+
+    ok "$f hardened ($before -> $(count_certs "$f") certificates)"
     record FIXED "system" "$f" "removed $removed compromised roots"
 }
 
@@ -820,10 +864,15 @@ conda_patch_env_bundle() {
         note "  would remove $removed compromised root(s) from $path"
         rm -f "$tmp"; return 0
     fi
-    cp -p "$path" "$path.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null || cp "$path" "$path.bak"
-    cat "$tmp" > "$path" && ok "  patched in place: $path (removed $removed)"
-    record FIXED "conda:$label" "$path" "patched in place, removed $removed root(s)"
+    backup_file "$path" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$path" || { warn "  failed to write $path"; rm -f "$tmp"; return 1; }
     rm -f "$tmp"
+    if [ -n "$(bundle_bad_roots "$path")" ]; then
+        warn "  $path still contains a compromised root after patching"
+        return 1
+    fi
+    ok "  patched in place: $path (removed $removed)"
+    record FIXED "conda:$label" "$path" "patched in place, removed $removed root(s)"
     return 0
 }
 
