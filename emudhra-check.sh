@@ -309,10 +309,65 @@ run_check() {
 #---------------------------------------------------------------------------
 if [ "$MODE" = fix ]; then
   note "Fetching impacted-intermediates.json ..."
-  curl -fsS -o "$TMPD/impacted.json" \
-    "https://emudhra.we-have-a-problem.com/impacted-intermediates.json" 2>/dev/null \
-    || note "  could not fetch list; --fix will have nothing to apply"
+  if curl -fsS -o "$TMPD/impacted.json" \
+       "https://emudhra.we-have-a-problem.com/impacted-intermediates.json" 2>/dev/null \
+     && [ -s "$TMPD/impacted.json" ]; then
+    note "  $(python3 -c "import json;print(len(json.load(open('$TMPD/impacted.json'))))" 2>/dev/null) fingerprints"
+  else
+    note "  could not fetch list; --fix will have nothing to apply"
+    rm -f "$TMPD/impacted.json"
+  fi
 fi
+
+# Markup appended to blocked.certs so reruns are idempotent.
+MARKER="# eMudhra compromised intermediates (CVE-2026-91403)"
+
+# mitigate_jdk <home>
+# Appends the compromised-intermediate fingerprints to that JDK's own
+# blocklist. Falls back to sudo for /Library installs. Prints a status line.
+mitigate_jdk() {
+  local home="$1" blocked="" hashes rc
+  for cand in "$home/lib/security/blocked.certs" \
+              "$home/jre/lib/security/blacklisted.certs"; do
+    [ -f "$cand" ] && blocked="$cand" && break
+  done
+  if [ -z "$blocked" ]; then
+    note "  --fix: no blocklist file under $home (needs a full JDK, not a JRE)"
+    return 1
+  fi
+  if grep -qF "$MARKER" "$blocked" 2>/dev/null; then
+    note "  --fix: already mitigated ($blocked)"
+    return 0
+  fi
+
+  hashes="$(python3 -c "
+import json
+for x in json.load(open('$TMPD/impacted.json')):
+    h = x.get('sha256') or x.get('fingerprint')
+    if h: print(h.upper())
+" 2>/dev/null)"
+  [ -n "$hashes" ] || { note "  --fix: no fingerprints available"; return 1; }
+
+  local sudo=""
+  if [ ! -w "$blocked" ]; then
+    command -v sudo >/dev/null 2>&1 || { note "  --fix: $blocked not writable and sudo unavailable"; return 1; }
+    sudo="sudo"
+  fi
+
+  # verified backup first, exactly like the shell/conda script does
+  if ! $sudo cp -p "$blocked" "$blocked.bak.$(date +%Y%m%d-%H%M%S)" 2>/dev/null; then
+    note "  --fix: could not back up $blocked - refusing to modify it"
+    return 1
+  fi
+
+  { printf '\n%s\n' "$MARKER"; printf '%s\n' "$hashes"; } | $sudo tee -a "$blocked" >/dev/null 2>&1
+  if grep -qF "$MARKER" "$blocked" 2>/dev/null; then
+    note "  --fix: appended fingerprints to $blocked (backup kept)"
+    return 0
+  fi
+  note "  --fix: failed to write $blocked"
+  return 1
+}
 
 #---------------------------------------------------------------------------
 # Main loop
@@ -381,12 +436,10 @@ while IFS= read -r home; do
 
   # Optional interim mitigation
   if [ "$MODE" = fix ] && [ "$status" = AFFECTED ]; then
-    blocked="$home/lib/security/blocked.certs"
-    [ -f "$blocked" ] || blocked="$home/jre/lib/security/blacklisted.certs"
-    if [ -f "$blocked" ] && [ -f "$TMPD/impacted.json" ]; then
-      cp "$blocked" "$blocked.bak.$(date +%Y%m%d%H%M%S)"
-      python3 -c "import json;[print(x['sha256']) for x in json.load(open('$TMPD/impacted.json'))]" >> "$blocked" \
-        && note "  interim blocklist appended to $blocked (backup kept)"
+    if [ -s "$TMPD/impacted.json" ]; then
+      mitigate_jdk "$home"
+    else
+      note "  --fix: no fingerprint list; mitigation skipped"
     fi
   fi
 done < "$CANDIDATES"

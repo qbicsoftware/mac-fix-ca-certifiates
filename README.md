@@ -306,6 +306,12 @@ brew upgrade --cask oracle-jdk@21    # cask: oracle-jdk@21, microsoft-openjdk, z
 On Apple Silicon these paths are symlinks; if the version does not change, run
 `brew reinstall <formula>` or `brew reinstall --cask <cask>`.
 
+> **Casks lag.** `brew upgrade --cask oracle-jdk@21` only helps once Oracle
+> publishes the patched build to its own download page. While it says *"the
+> latest version is already installed"*, there is no cask upgrade yet — use
+> [`--fix`](#if-no-fixed-build-is-available-yet) in the meantime. The Homebrew
+> *formula* `openjdk@21` is already at `21.0.13.0.2`.
+
 **Manual `.pkg`** — `/Library/Java/JavaVirtualMachines/...` (Oracle, Microsoft,
 Adoptium, Azul, …): download the fixed `.pkg` from **your vendor** (Oracle from
 oracle.com, Microsoft from <https://aka.ms/download-jdk>, Adoptium from
@@ -337,8 +343,12 @@ bash emudhra-check.sh --fix
 
 It appends the compromised-intermediate fingerprints to every affected JDK's
 `blocked.certs` (Java 8: `jre/lib/security/blacklisted.certs`) and keeps a
-timestamped backup. Hand-added entries cover the 16 primary encodings only — the
-vendor fixed build blocks all 48 variants — so still upgrade once it lands.
+timestamped backup. For JDKs under `/Library/Java/...` (system `.pkg` and cask
+installs) it needs write access, so run it as `sudo bash emudhra-check.sh --fix`
+if it reports the file is not writable. Hand-added entries cover the 16 primary
+encodings only — the vendor fixed build blocks all 48 variants — so still
+upgrade once it lands, then re-run the audit: a patched build reports `PATCHED`
+even though the blocklist entries remain.
 
 ## After running
 
