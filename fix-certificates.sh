@@ -29,12 +29,13 @@
 #
 # Options:
 #   -n, --dry-run        apply: only show what would be changed
-#   -y, --yes            assume "yes", never prompt
+#   -y, --yes            assume "yes", never prompt (also accepts the backup offer)
 #       --offline        do not contact the checker hosts (no network probes)
 #       --json           assess: also print a machine readable summary
 #       --no-conda       skip the conda environment sweep
 #       --no-pip         skip the pip / python remediation
 #       --no-system      skip the /etc/ssl/cert.pem remediation
+#       --no-backup      apply: do not offer the full trust store snapshot
 #       --timeout N      network timeout in seconds (default 15)
 #   -h, --help           show this help
 #
@@ -85,6 +86,7 @@ JSON_OUT=0
 DO_CONDA=1
 DO_PIP=1
 DO_SYSTEM=1
+DO_BACKUP=1
 TIMEOUT=15
 
 SELF="$(basename "$0")"
@@ -106,6 +108,8 @@ while [ $# -gt 0 ]; do
         --no-conda)     DO_CONDA=0 ;;
         --no-pip)       DO_PIP=0 ;;
         --no-system)    DO_SYSTEM=0 ;;
+        --backup)       DO_BACKUP=1 ;;
+        --no-backup)    DO_BACKUP=0 ;;
         --timeout)      shift; TIMEOUT="${1:-15}" ;;
         -h|--help)      print_help; exit 0 ;;
         *) printf 'Unknown argument: %s\n\n' "$1" >&2; print_help >&2; exit 2 ;;
@@ -700,19 +704,37 @@ file_sha256() {
     fi
 }
 
+# Set by do_snapshot_all: lines of "<path>\t<backup>" so that a file
+# snapshotted earlier in the same run is not backed up a second time.
+SNAPSHOT_INDEX=""
+snapshot_lookup() {
+    local r
+    [ -n "$SNAPSHOT_INDEX" ] || return 1
+    r="$(printf '%s\n' "$SNAPSHOT_INDEX" | awk -F'\t' -v k="$1" '$1==k{print $2; exit}')"
+    [ -n "$r" ] || return 1
+    printf '%s\n' "$r"
+}
+
 # backup_file <path> - copy <path> to <path>.bak.<timestamp> and verify it.
 # Falls back to sudo for root owned files and returns non-zero when no
 # verified backup could be made, so callers can refuse to modify the file.
 # Sets LAST_BACKUP on success.
 LAST_BACKUP=""
 backup_file() {
-    local f="$1" ts bak ok=0 src_sum bak_sum
+    local f="$1" ts bak ok=0 src_sum bak_sum snap
     ts="$(date +%Y%m%d-%H%M%S)"
     bak="$f.bak.$ts"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         note "would back up $f -> $bak"
         LAST_BACKUP="$bak"
+        return 0
+    fi
+
+    # reuse the snapshot taken earlier in this run, if there is one
+    if snap="$(snapshot_lookup "$f")"; then
+        LAST_BACKUP="$snap"
+        note "backup: $snap (taken at the start of this run)"
         return 0
     fi
 
@@ -1070,6 +1092,21 @@ section_label() {
     esac
 }
 
+# Compact list of what apply is about to change, shown before the prompts.
+print_affected_targets() {
+    local n; n="$(count_status AFFECTED)"
+    printf '  About to modify %s%d%s affected trust store(s):\n' "$C_BOLD" "$n" "$C_RESET"
+    local last="" st sec tgt det
+    while IFS=$'\t' read -r st sec tgt det; do
+        [ "$st" = "AFFECTED" ] || continue
+        if [ "$sec" != "$last" ]; then
+            printf '    %s%s%s\n' "$C_BOLD" "$(section_label "$sec")" "$C_RESET"
+            last="$sec"
+        fi
+        printf '      %s\n' "$tgt"
+    done < "$RESULTS_FILE"
+}
+
 # Loud, grouped list of everything that is still affected.
 print_attention() {
     local n; n="$(count_status AFFECTED)"
@@ -1193,27 +1230,39 @@ EOF
 # -----------------------------------------------------------------------------
 # BACKUP - snapshot every trust store without changing anything
 # -----------------------------------------------------------------------------
-backup_all() {
-    hdr "Backing up trust stores"
-    local f n=0 failed=0
+BACKUPS_MADE=0
+BACKUPS_FAILED=0
+
+do_snapshot_all() {
+    BACKUPS_MADE=0
+    BACKUPS_FAILED=0
+    SNAPSHOT_INDEX=""
+    local f
     while IFS= read -r f; do
         [ -n "$f" ] && [ -f "$f" ] || continue
         if backup_file "$f"; then
-            n=$((n + 1))
+            BACKUPS_MADE=$((BACKUPS_MADE + 1))
+            [ -n "$LAST_BACKUP" ] && SNAPSHOT_INDEX="${SNAPSHOT_INDEX}${f}	${LAST_BACKUP}
+"
         else
-            failed=$((failed + 1))
+            BACKUPS_FAILED=$((BACKUPS_FAILED + 1))
         fi
     done <<EOF
 $(all_bundle_paths)
 EOF
+    return 0
+}
+backup_all() {
+    hdr "Backing up trust stores"
+    do_snapshot_all
 
     hdr "Summary"
     if [ "$DRY_RUN" -eq 1 ]; then
-        printf '  would back up : %s\n' "$n"
+        printf '  would back up : %s\n' "$BACKUPS_MADE"
     else
-        printf '  backed up : %s\n' "$n"
+        printf '  backed up : %s\n' "$BACKUPS_MADE"
     fi
-    [ "$failed" -gt 0 ] && printf '  failed    : %s%s%s\n' "$C_RED" "$failed" "$C_RESET"
+    [ "$BACKUPS_FAILED" -gt 0 ] && printf '  failed    : %s%s%s\n' "$C_RED" "$BACKUPS_FAILED" "$C_RESET"
     exit 0
 }
 
@@ -1281,17 +1330,54 @@ main() {
     fi
 
     hdr "REMEDIATION"
+
     if [ "$DRY_RUN" -eq 1 ]; then
         warn "dry run: no changes will be made"
-    elif [ "$ASSUME_YES" -eq 0 ]; then
-        printf 'About to modify %d affected trust store(s) on this host.\n' "$affected"
-        printf 'Backups are taken before every file is touched.\n'
-        printf 'Continue? [y/N] '
-        read -r reply
-        case "$reply" in
-            y|Y|yes|YES) ;;
-            *) printf 'Aborted.\n'; exit 2 ;;
-        esac
+        note "a normal run would offer to back up all trust stores first (default: yes)"
+    else
+        print_affected_targets
+
+        if [ "$ASSUME_YES" -eq 0 ] && [ ! -t 0 ]; then
+            warn "no terminal available to ask for confirmation"
+            note "re-run with --yes to apply anyway, or add --dry-run to preview"
+            exit 2
+        fi
+
+        # ---- backup prompt, recommended and defaulting to yes ----
+        local do_snapshot=1
+        if [ "$DO_BACKUP" -eq 0 ]; then
+            do_snapshot=0
+            note "--no-backup given: skipping the full snapshot"
+        elif [ "$ASSUME_YES" -eq 0 ]; then
+            printf '\n  %sRecommended:%s back up every trust store before changing anything.\n' \
+                "$C_GREEN" "$C_RESET"
+            printf '  Back up all trust stores now? [Y/n] '
+            read -r reply
+            case "$reply" in
+                n|N|no|NO|never) do_snapshot=0 ;;
+                *) do_snapshot=1 ;;
+            esac
+        fi
+
+        if [ "$do_snapshot" -eq 1 ]; then
+            hdr "Backup"
+            do_snapshot_all
+            if [ "$BACKUPS_FAILED" -gt 0 ]; then
+                warn "$BACKUPS_FAILED trust store(s) could not be backed up"
+            fi
+            ok "$BACKUPS_MADE trust store(s) backed up"
+        else
+            note "no full snapshot taken; a verified backup is still written before every single file that is modified"
+        fi
+
+        # ---- go / no-go ----
+        if [ "$ASSUME_YES" -eq 0 ]; then
+            printf '\n  Apply the fixes now? [Y/n] '
+            read -r reply
+            case "$reply" in
+                n|N|no|NO|never) printf 'Aborted. Nothing was modified.\n'; exit 2 ;;
+            esac
+        fi
     fi
 
     [ "$DO_SYSTEM" -eq 1 ] && apply_system

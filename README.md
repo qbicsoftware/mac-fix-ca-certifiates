@@ -72,26 +72,18 @@ environment bundle, finds the newest `.bak.<timestamp>` next to each one and
 puts it back (backing up the current file first). Use `--dry-run` to see what
 it would do.
 
-## Safety
+`apply` asks before it touches anything:
 
-The original file is never removed, and it is never written in place:
+1. **Back up every trust store first? [Y/n]** - recommended, and the default
+is **yes**, so just press Enter. This snapshots `/etc/ssl/cert.pem` and every
+conda environment bundle before any change is made.
+2. **Apply the fixes now? [Y/n]** - defaults to **yes**.
 
-1. **A backup is taken first**, as `<file>.bak.<timestamp>`, and it is verified
-to be byte-for-byte identical to the original before anything else happens.
-If no verified backup can be made - for example because the directory is
-read-only and `sudo` is unavailable - the script **refuses to modify the file
-at all**.
-2. **The replacement is written next to the target and moved into place with
-an atomic rename.** An interrupted run therefore leaves either the complete
-old file or the complete new one, never a truncated or half-written bundle.
-3. **Sanity checks before writing**: a bundle that would lose more than a
-handful of certificates, or where nothing was actually removed, is rejected.
-4. **The bundle is re-read after writing.** If a compromised root is somehow
-still there, the backup is put back automatically and the fix is reported as
-failed.
-5. Nothing in the script ever deletes a `.bak` file.
-
-No password is stored and no other file is touched.
+Both questions are skipped for unattended runs: `--yes` answers yes to both,
+`--no-backup` skips the snapshot (a verified per-file backup is still written
+before every single file is modified), and `--dry-run` changes nothing at all.
+If there is no terminal to prompt on, `apply` refuses to run unless `--yes` is
+given.
 
 Useful flags:
 
@@ -104,6 +96,7 @@ Useful flags:
 | `--no-conda` | skip the conda environment sweep |
 | `--no-pip` | skip the pip / python remediation |
 | `--no-system` | skip `/etc/ssl/cert.pem` |
+| `--no-backup` | `apply`: skip the upfront snapshot offer (per-file backups still happen) |
 | `--timeout N` | network timeout in seconds (default 15) |
 
 Exit code is `0` when nothing is left to fix and `1` when something is still
@@ -112,6 +105,29 @@ affected, so it can be used in scripts and CI:
 ```bash
 ./fix-certificates.sh assess --json --offline | jq '.summary'
 ```
+
+## Safety
+
+The original file is never removed, and it is never written in place:
+
+1. **A backup is taken first**, either as an upfront snapshot of every trust
+store (`apply` recommends this and defaults to yes) or, if you decline, as
+`<file>.bak.<timestamp>` immediately before each file is written. The backup
+is verified to be byte-for-byte identical to the original before anything else
+happens. If no verified backup can be made - for example because the directory
+is read-only and `sudo` is unavailable - the script **refuses to modify the
+file at all**.
+2. **The replacement is written next to the target and moved into place with
+an atomic rename.** An interrupted run therefore leaves either the complete
+old file or the complete new one, never a truncated or half-written bundle.
+3. **Sanity checks before writing**: a bundle that would lose more than a
+handful of certificates, or where nothing was actually removed, is rejected.
+4. **The bundle is re-read after writing.** If a compromised root is somehow
+still there, the backup is put back automatically and the fix is reported as
+failed.
+5. Nothing in the script ever deletes a `.bak` file.
+
+No password is stored and no other file is touched.
 
 ## What the assessment does
 
