@@ -1,19 +1,21 @@
 #!/bin/bash
 #
-# emudhra-check.sh - Audit a macOS machine's JDKs against CVE-2026-91403
-#                   (compromised eMudhra intermediate CAs).
+# emudhra-check.sh - Audit a macOS or Linux machine's JDKs against
+#                   CVE-2026-91403 (compromised eMudhra intermediate CAs).
 #
 # Discovers every JDK it can find (system installers, SDKMAN, Homebrew, jenv,
-# asdf, mise) and tests whether each one still accepts TLS chains signed by the
-# compromised intermediates. For every affected JDK it also reports where that
-# JDK was installed from and the command that updates it.
+# asdf, mise and common Linux locations) and tests whether each one still
+# accepts TLS chains signed by the compromised intermediates. For every affected
+# JDK it also reports where that JDK was installed from and the command that
+# updates it.
 #
 # Usage:
 #   bash emudhra-check.sh              # audit only (default)
 #   bash emudhra-check.sh --inventory  # list JDKs + versions, skip network test
 #   bash emudhra-check.sh --fix        # audit, then append interim blocklist
 #                                      # entries to affected JDKs (makes backups,
-#                                      # re-tests, reports MITIGATED)
+#                                      # re-tests, reports MITIGATED).
+#                                      # macOS only; refuses unsupported installs.
 #   bash emudhra-check.sh --json       # machine-readable result on stdout
 #
 # Re-download the latest copy before relying on the result:
@@ -33,12 +35,16 @@
 # Test hosts belong to the public disclosure site emudhra.we-have-a-problem.com
 # and intentionally serve certificates from the compromised CAs.
 #
+# Platforms: audit works on macOS and Linux. --fix is macOS-only (see the
+# --fix support policy below) and refuses installs whose trust store it cannot
+# safely own.
+#
 set -u
 
 # Bump on every change. Shown by --help and at the top of every run so a stale
 # local copy is obvious; re-download from
 #   https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
-VERSION="1.3"
+VERSION="1.4"
 
 #---------------------------------------------------------------------------
 # Options
@@ -49,7 +55,7 @@ for arg in "$@"; do
     --inventory) MODE=inventory ;;
     --fix)       MODE=fix ;;
     --json)      MODE=json ;;
-    -h|--help)   printf 'emudhra-check.sh (version %s)\n\n' "$VERSION"; sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   printf 'emudhra-check.sh (version %s)\n\n' "$VERSION"; sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -124,6 +130,25 @@ done
 add_candidates "$HOME"/.jenv/versions/*/
 add_candidates "$HOME"/.asdf/installs/java/*/
 add_candidates "$HOME"/.local/share/mise/installs/java/*/
+
+# 7) Linux: distro packages, Oracle RPMs, manual tarballs, IDE-bundled runtimes
+add_candidates /usr/lib/jvm/*/ /usr/lib/jvm/*/jre/
+add_candidates /usr/java/*/ /usr/java/*/jre/
+add_candidates /opt/java/*/ /opt/*jdk*/ /opt/java/jdk*/
+add_candidates /usr/lib64/jvm/*/
+add_candidates "$HOME"/.jdks/*/                      # IntelliJ IDEA
+add_candidates /snap/*/*/*/jbr/ /snap/*/*/jbr/      # JetBrains / bundled JBR
+add_candidates /nix/store/*openjdk*/lib/openjdk/
+
+# 8) Whatever update-alternatives considers installed (resolves symlinks)
+if command -v update-alternatives >/dev/null 2>&1; then
+  while IFS= read -r alt; do
+    [ -n "$alt" ] || continue
+    add_candidates "$(dirname "$(dirname "$alt")")"
+  done <<EOF
+$(update-alternatives --list java 2>/dev/null)
+EOF
+fi
 
 # Deduplicate and keep a stable order
 sort -u "$CANDIDATES" -o "$CANDIDATES"
@@ -284,7 +309,21 @@ install_source() {  # <home> <vendor-name>
       return ;;
   esac
 
-  printf '%s\n' "unknown|update this JDK to the fixed build for its release family"
+  # Linux package-managed homes and IDE-bundled runtimes. Kept to naming the
+  # source only; the update path is not automated.
+  case "$home" in
+    /usr/lib/jvm/*openjdk*|/usr/lib64/jvm/*openjdk*)
+      printf '%s\n' "OS package|update the OpenJDK package with your distribution" ;;
+    /usr/lib/jvm/*|/usr/lib64/jvm/*|/usr/java/*)
+      printf '%s\n' "OS package / vendor RPM|update with your distribution or vendor" ;;
+    /usr/lib/openjdk/*)
+      printf '%s\n' "OS package|update with your distribution (Arch: pacman -Syu)" ;;
+    /snap/*|/nix/store/*)
+      printf '%s\n' "snap/Nix|snap refresh ${home%%/*}  /  nix profile upgrade" ;;
+    "$HOME"/.jdks/*)
+      printf '%s\n' "IDE-bundled (IntelliJ/.jdks)|install a fixed JDK and point the IDE at it" ;;
+    *) printf '%s\n' "unknown|update this JDK to the fixed build for its release family" ;;
+  esac
 }
 
 homebrew_formula() {
@@ -363,6 +402,54 @@ jdk_is_mitigated() {
   grep -qF "$MARKER" "$blocked" 2>/dev/null
 }
 
+# canon_path <path>  -> absolute, symlink-resolved path (portable; macOS
+# `readlink` has no -f). Falls back to the input when it cannot be resolved.
+canon_path() {
+  local p="$1" dir base
+  if [ -d "$p" ]; then
+    dir=$(CDPATH= cd -- "$p" 2>/dev/null && pwd -P) && { printf '%s' "$dir"; return; }
+    printf '%s' "$p"; return
+  fi
+  [ -e "$p" ] || { printf '%s' "$p"; return; }
+  dir=$(CDPATH= cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P) || { printf '%s' "$p"; return; }
+  base=$(basename -- "$p")
+  printf '%s/%s' "$dir" "$base"
+}
+
+# --fix support policy ------------------------------------------------------
+# --fix only writes a JDK's own trust store, and only where we know that file
+# is really the one the JVM reads. Some distributions (Debian, Ubuntu, Fedora,
+# Arch) point lib/security/blocked.certs / cacerts at a file outside the JDK,
+# or make the JVM read the OS trust store entirely, so editing it under $home
+# would do nothing, and --fix must not pretend to fix those.
+#
+# Supported (macOS, what this script was built for):
+#   - SDKMAN, jenv, asdf, mise, IDE-bundled homes under $HOME
+#   - Homebrew prefixes, and /Library/Java .pkg / cask installs
+# Anything else (distro /usr/lib/jvm, /usr/lib64/jvm, /usr/java, snap, Nix,
+# /opt, /usr/share) is refused.
+FIX_ALLOWED_PREFIXES=(
+  "/Library/Java/"
+  "$HOME/.sdkman/"
+  "$HOME/.jenv/"
+  "$HOME/.asdf/"
+  "$HOME/.local/share/mise/"
+  "$HOME/.jdks/"
+  "/opt/homebrew/"
+  "/usr/local/"
+)
+
+fix_supported() {  # <home>
+  local home="$1" p
+  case "$home" in
+    "$HOME"/*) return 0 ;;              # user-owned homes are fine
+  esac
+  for p in "${FIX_ALLOWED_PREFIXES[@]}"; do
+    case "$home" in "$p"*) return 0 ;; esac
+  done
+  return 1
+}
+
 # mitigate_jdk <home>
 # Appends the compromised-intermediate fingerprints to that JDK's own
 # blocklist. Falls back to sudo for /Library installs. Prints a status line.
@@ -372,6 +459,12 @@ mitigate_jdk() {
     note "  --fix: no blocklist file under $home (needs a full JDK, not a JRE)"
     return 1
   }
+  # Defence in depth: a blocklist symlinked out of the JDK (Debian/Ubuntu point
+  # it at /etc/java-*-openjdk/security) is distro-managed; do not touch it.
+  if [ -L "$blocked" ] || [ "$(canon_path "$blocked")" != "$blocked" ]; then
+    note "  --fix: $blocked is not a regular file inside the JDK; refusing"
+    return 1
+  fi
   if grep -qF "$MARKER" "$blocked" 2>/dev/null; then
     note "  --fix: already mitigated ($blocked)"
     return 0
@@ -474,7 +567,16 @@ while IFS= read -r home; do
   # Interim mitigation with re-verification: block the intermediates, then
   # test again. A JDK that now rejects the chains is reported as MITIGATED.
   if [ "$MODE" = fix ] && [ "$status" = AFFECTED ]; then
-    if [ -s "$TMPD/impacted.json" ]; then
+    if ! fix_supported "$home"; then
+      # e.g. a distribution JDK under /usr/lib/jvm. Its trust store is managed
+      # by the OS package (ca-certificates / /etc/java-*-openjdk) and, on many
+      # distros, the JVM does not even read the JDK-local blocklist. Refuse
+      # rather than write something the JVM ignores.
+      note "  --fix: refusing to modify $home"
+      note "        unsupported for --fix; update the JDK through its package"
+      note "        manager (or the OS trust store) instead."
+      detail="$detail (--fix skipped: unsupported install)"
+    elif [ -s "$TMPD/impacted.json" ]; then
       if mitigate_jdk "$home"; then
         note "  re-testing $ver ..."
         if run_check "$home" "$major" "$TMPD/out2"; then
