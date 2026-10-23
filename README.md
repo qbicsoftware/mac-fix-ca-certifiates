@@ -354,10 +354,12 @@ now reject the chains, so you can see the change took effect:
   MITIGATED   21.0.12.1 (Oracle JDK) blocked via blocked.certs (interim; upgrade still recommended)
 ```
 
-Confirm with a plain run afterwards (a fresh shell avoids any JVM that was
-started before the change) — a JDK with only the blocklist shows `PATCHED`. The
-interim entries cover the 16 primary encodings, whereas the vendor fixed build
-covers all 48 variants, so still upgrade once it lands.
+The status sticks: a later plain `bash emudhra-check.sh` (in a fresh shell, so no
+JVM started before the change is in the way) still reports `MITIGATED` — not
+`PATCHED` — because the script recognises the entries it added, and keeps showing
+the upgrade command. Only a vendor-patched build reports `PATCHED`. The interim
+entries cover the 16 primary encodings, whereas the vendor fixed build covers all
+48 variants, so still upgrade once it lands.
 
 ## After running
 

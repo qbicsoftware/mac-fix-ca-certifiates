@@ -17,9 +17,14 @@
 #   bash emudhra-check.sh --json       # machine-readable result on stdout
 #
 # Exit codes:
-#   0 = no affected JDK found (or all were mitigated by --fix)
+#   0 = nothing vulnerable (a JDK protected only by the interim blocklist is
+#       reported as MITIGATED, still exit 0, with an upgrade reminder)
 #   1 = at least one affected JDK
 #   2 = nothing to test / error   3 = audited but results inconclusive
+#
+# Statuses: AFFECTED (trusts the compromised chains), MITIGATED (rejects them
+# only because the interim blocklist from --fix is present; upgrade still
+# recommended), PATCHED (rejects them on a vendor-patched build), UNKNOWN.
 #
 # Test hosts belong to the public disclosure site emudhra.we-have-a-problem.com
 # and intentionally serve certificates from the compromised CAs.
@@ -35,7 +40,7 @@ for arg in "$@"; do
     --inventory) MODE=inventory ;;
     --fix)       MODE=fix ;;
     --json)      MODE=json ;;
-    -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -51,6 +56,14 @@ fi
 
 say()  { [ "$MODE" = json ] || printf '%s\n' "$*"; }
 note() { [ "$MODE" = json ] || printf '%s\n' "$*" >&2; }
+
+#---------------------------------------------------------------------------
+# Constants
+#---------------------------------------------------------------------------
+# Marker line written into blocked.certs by --fix. Its presence on a later
+# plain run means the JDK is only protected by our interim blocklist, not by a
+# vendor-patched build, so it is reported as MITIGATED rather than PATCHED.
+MARKER="# eMudhra compromised intermediates (CVE-2026-91403)"
 
 #---------------------------------------------------------------------------
 # Temp workspace
@@ -322,21 +335,34 @@ if [ "$MODE" = fix ]; then
 fi
 
 # Markup appended to blocked.certs so reruns are idempotent.
-MARKER="# eMudhra compromised intermediates (CVE-2026-91403)"
+# (MARKER is defined near the top of the script.)
+
+# jdk_blocklist <home>  -> path to that JDK's blocklist, or empty
+jdk_blocklist() {
+  local home="$1" cand
+  for cand in "$home/lib/security/blocked.certs" \
+              "$home/jre/lib/security/blacklisted.certs"; do
+    [ -f "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  return 1
+}
+
+# jdk_is_mitigated <home>  -> 0 if our interim marker is present
+jdk_is_mitigated() {
+  local blocked
+  blocked=$(jdk_blocklist "$1") || return 1
+  grep -qF "$MARKER" "$blocked" 2>/dev/null
+}
 
 # mitigate_jdk <home>
 # Appends the compromised-intermediate fingerprints to that JDK's own
 # blocklist. Falls back to sudo for /Library installs. Prints a status line.
 mitigate_jdk() {
-  local home="$1" blocked="" hashes rc
-  for cand in "$home/lib/security/blocked.certs" \
-              "$home/jre/lib/security/blacklisted.certs"; do
-    [ -f "$cand" ] && blocked="$cand" && break
-  done
-  if [ -z "$blocked" ]; then
+  local home="$1" blocked="" hashes
+  blocked=$(jdk_blocklist "$home") || {
     note "  --fix: no blocklist file under $home (needs a full JDK, not a JRE)"
     return 1
-  fi
+  }
   if grep -qF "$MARKER" "$blocked" 2>/dev/null; then
     note "  --fix: already mitigated ($blocked)"
     return 0
@@ -422,7 +448,15 @@ while IFS= read -r home; do
     if [ "$cv" -gt 0 ]; then
       status=AFFECTED; detail="$cv of 12 compromised chains trusted"
     elif [ "$co" -gt 0 ]; then
-      status=PATCHED; detail="all reachable compromised chains rejected"
+      # Rejected the chains. Distinguish a vendor-patched build from one that is
+      # only protected by the interim blocklist we added with --fix, so a plain
+      # run still flags the latter as needing an upgrade.
+      if jdk_is_mitigated "$home"; then
+        status=MITIGATED
+        detail="blocked via blocked.certs (interim; upgrade still recommended)"
+      else
+        status=PATCHED; detail="all reachable compromised chains rejected"
+      fi
     else
       status=UNKNOWN; detail="no test host reachable (network/proxy?)"
     fi
@@ -502,7 +536,7 @@ while IFS='|' read -r status ver vendor home detail isource iupdate; do
   esac
   printf '  %s%-10s%s  %-9s (%s) %s\n' "$col" "$status" "$C_RESET" "$ver" "$vendor" "$detail"
   printf '             %s\n' "$home"
-  if [ "$status" = AFFECTED ]; then
+  if [ "$status" = AFFECTED ] || [ "$status" = MITIGATED ]; then
     printf '             %ssource: %s -> %s%s\n' "$C_BOLD" "$isource" "$iupdate" "$C_RESET"
   fi
 done < "$RESULTS"
@@ -521,8 +555,13 @@ if [ "$AFFECTED" -gt 0 ]; then
 fi
 
 if [ "$MITIGATED" -gt 0 ]; then
-  say "  ${C_GREEN}All affected JDKs are now blocked.${C_RESET} Re-run without --fix to confirm"
-  say "  on a fresh shell, and still upgrade to a fixed build when your vendor ships it."
+  if [ "$MODE" = fix ]; then
+    say "  ${C_GREEN}All affected JDKs are now blocked.${C_RESET} Re-run without --fix to confirm"
+    say "  on a fresh shell, and still upgrade to a fixed build when your vendor ships it."
+  else
+    say "  ${C_GREEN}No JDK is vulnerable.${C_RESET} $MITIGATED JDK(s) are protected only by the interim"
+    say "  blocklist added by --fix, so they still need upgrading (see the source line above)."
+  fi
   say ""
   exit 0
 fi
