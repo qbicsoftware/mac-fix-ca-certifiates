@@ -63,13 +63,41 @@ covered:
 ./fix-certificates.sh assess       # same thing
 ./fix-certificates.sh apply        # apply the fixes
 ./fix-certificates.sh apply --dry-run   # show what would change, change nothing
+./fix-certificates.sh backup       # snapshot every trust store, change nothing
+./fix-certificates.sh restore      # put the newest snapshot back
 ```
+
+`restore` is the undo button: it walks `/etc/ssl/cert.pem` and every conda
+environment bundle, finds the newest `.bak.<timestamp>` next to each one and
+puts it back (backing up the current file first). Use `--dry-run` to see what
+it would do.
+
+## Safety
+
+The original file is never removed, and it is never written in place:
+
+1. **A backup is taken first**, as `<file>.bak.<timestamp>`, and it is verified
+to be byte-for-byte identical to the original before anything else happens.
+If no verified backup can be made - for example because the directory is
+read-only and `sudo` is unavailable - the script **refuses to modify the file
+at all**.
+2. **The replacement is written next to the target and moved into place with
+an atomic rename.** An interrupted run therefore leaves either the complete
+old file or the complete new one, never a truncated or half-written bundle.
+3. **Sanity checks before writing**: a bundle that would lose more than a
+handful of certificates, or where nothing was actually removed, is rejected.
+4. **The bundle is re-read after writing.** If a compromised root is somehow
+still there, the backup is put back automatically and the fix is reported as
+failed.
+5. Nothing in the script ever deletes a `.bak` file.
+
+No password is stored and no other file is touched.
 
 Useful flags:
 
 | Flag | Meaning |
 | --- | --- |
-| `-n`, `--dry-run` | `apply`: only report what would be done |
+| `-n`, `--dry-run` | `apply`/`restore`/`backup`: only report what would be done |
 | `-y`, `--yes` | never prompt for confirmation |
 | `--offline` | skip the live TLS probes (offline / air-gapped hosts) |
 | `--json` | print a machine readable report on stdout (human output goes to stderr) |
@@ -171,8 +199,9 @@ Transparency as well.
 
 ## What `apply` changes
 
-Every file it touches is backed up first (`<file>.bak.<timestamp>`), and it
-refuses to write a bundle if the result looks wrong.
+Every file it touches is backed up first (`<file>.bak.<timestamp>`, verified
+byte-identical - see [Safety](#safety)), and it refuses to write a bundle if
+the result looks wrong.
 
 1. **`/etc/ssl/cert.pem`** — removes exactly the two compromised roots and
    their descriptive blocks, keeping the file's `### ` / `=== ` structure

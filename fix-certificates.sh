@@ -24,6 +24,8 @@
 #   ./fix-certificates.sh                 # same as: assess
 #   ./fix-certificates.sh assess          # read-only assessment (default)
 #   ./fix-certificates.sh apply           # apply the fixes
+#   ./fix-certificates.sh backup          # snapshot every trust store, change nothing
+#   ./fix-certificates.sh restore         # put the newest snapshot back
 #
 # Options:
 #   -n, --dry-run        apply: only show what would be changed
@@ -88,13 +90,15 @@ TIMEOUT=15
 SELF="$(basename "$0")"
 
 print_help() {
-    sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR==1{next} /^# ={10,}/{n++; if(n==2) exit; next} {sub(/^# ?/,""); print}' "$0"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         assess|check|status) ACTION="assess" ;;
         apply|fix|remediate) ACTION="apply" ;;
+        restore|revert|undo) ACTION="restore" ;;
+        backup|snapshot) ACTION="backup" ;;
         -n|--dry-run)   DRY_RUN=1 ;;
         -y|--yes)       ASSUME_YES=1 ;;
         --offline)      OFFLINE=1 ;;
@@ -678,34 +682,139 @@ print(removed)
 PYEOF
 }
 
-# backup_file <path> - copies <path> to <path>.bak.<timestamp>.
-# Falls back to sudo for root owned files (e.g. /etc/ssl/cert.pem) and
-# returns non-zero when no backup could be created, so callers can refuse to
-# modify a file they cannot restore.
+# -----------------------------------------------------------------------------
+# Backups and safe installation
+#
+# The original file is never removed and never written in place: a backup is
+# taken first, and the replacement is written next to the target and moved
+# into place with an atomic rename. An interrupted run therefore leaves either
+# the complete old file or the complete new one, never a truncated bundle.
+# -----------------------------------------------------------------------------
+file_sha256() {
+    if [ -n "$PYTHON" ]; then
+        "$PYTHON" -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1" 2>/dev/null
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        cksum "$1" 2>/dev/null | awk '{print $1"-"$2}'
+    fi
+}
+
+# backup_file <path> - copy <path> to <path>.bak.<timestamp> and verify it.
+# Falls back to sudo for root owned files and returns non-zero when no
+# verified backup could be made, so callers can refuse to modify the file.
+# Sets LAST_BACKUP on success.
+LAST_BACKUP=""
 backup_file() {
-    local f="$1" ts bak
+    local f="$1" ts bak ok=0 src_sum bak_sum
     ts="$(date +%Y%m%d-%H%M%S)"
     bak="$f.bak.$ts"
 
     if [ "$DRY_RUN" -eq 1 ]; then
         note "would back up $f -> $bak"
+        LAST_BACKUP="$bak"
         return 0
     fi
 
-    if cp -p "$f" "$bak" 2>/dev/null || cp "$f" "$bak" 2>/dev/null; then
-        [ -s "$bak" ] || { bad "backup of $f is empty"; return 1; }
-        note "backup: $bak"
-        return 0
+    # never clobber a backup that is already there
+    if [ -e "$bak" ]; then
+        bak="$bak.$$"
     fi
 
-    if command -v sudo >/dev/null 2>&1 && sudo cp -p "$f" "$bak" 2>/dev/null; then
-        [ -s "$bak" ] || { bad "backup of $f is empty"; return 1; }
-        note "backup: $bak (via sudo)"
-        return 0
+    cp -p "$f" "$bak" 2>/dev/null && ok=1
+    [ "$ok" -eq 1 ] || { cp "$f" "$bak" 2>/dev/null && ok=1; }
+    if [ "$ok" -eq 0 ] && command -v sudo >/dev/null 2>&1; then
+        sudo cp -p "$f" "$bak" 2>/dev/null && ok=1
     fi
 
-    bad "could not create a backup of $f - refusing to modify it"
+    if [ "$ok" -eq 0 ] || [ ! -s "$bak" ]; then
+        bad "could not create a backup of $f - refusing to modify it"
+        return 1
+    fi
+
+    # it must be byte for byte the same file, not an empty or partial copy
+    src_sum="$(file_sha256 "$f")"
+    bak_sum="$(file_sha256 "$bak")"
+    if [ -n "$src_sum" ] && [ "$src_sum" != "$bak_sum" ]; then
+        bad "backup of $f does not match the original - refusing to modify it"
+        return 1
+    fi
+
+    LAST_BACKUP="$bak"
+    note "backup: $bak"
+    return 0
+}
+
+# install_file_atomic <src> <dst>
+install_file_atomic() {
+    local src="$1" dst="$2" new mode owner
+    new="$dst.new.$$"
+    mode="$(stat -f '%Lp' "$dst" 2>/dev/null || printf '644')"
+    owner="$(stat -f '%Su:%Sg' "$dst" 2>/dev/null || true)"
+
+    if cp "$src" "$new" 2>/dev/null; then
+        chmod "$mode" "$new" 2>/dev/null
+        if mv -f "$new" "$dst"; then
+            return 0
+        fi
+        rm -f "$new"
+        return 1
+    fi
+
+    command -v sudo >/dev/null 2>&1 || return 1
+    sudo cp "$src" "$new" 2>/dev/null || { sudo rm -f "$new" 2>/dev/null; return 1; }
+    sudo chmod "$mode" "$new" 2>/dev/null
+    if ! sudo mv -f "$new" "$dst"; then
+        sudo rm -f "$new" 2>/dev/null
+        return 1
+    fi
+    [ -n "$owner" ] && sudo chown "$owner" "$dst" 2>/dev/null
+    return 0
+}
+
+# find_newest_backup <path> - newest <path>.bak* or empty
+find_newest_backup() {
+    local f="$1" b newest=""
+    for b in "$f".bak "$f".bak.*; do
+        [ -e "$b" ] || continue
+        if [ -z "$newest" ] || [ "$b" -nt "$newest" ]; then
+            newest="$b"
+        fi
+    done
+    [ -n "$newest" ] && printf '%s\n' "$newest"
+    return 0
+}
+
+# restore_file <path> - put the newest verified backup back in place
+restore_file() {
+    local f="$1" b
+    b="$(find_newest_backup "$f")"
+    if [ -z "$b" ]; then
+        return 2
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        note "would restore $f from $b"
+        return 0
+    fi
+    # keep the current file too, in case the restore is not wanted
+    backup_file "$f" >/dev/null 2>&1 || true
+    if install_file_atomic "$b" "$f"; then
+        ok "restored $f from $b"
+        return 0
+    fi
+    bad "could not restore $f from $b"
     return 1
+}
+
+# every CA bundle the script knows about
+all_bundle_paths() {
+    printf '%s\n' /etc/ssl/cert.pem
+    local conda env
+    conda="$(discover_conda)" || return 0
+    conda_env_list "$conda" | while IFS= read -r env; do
+        [ -n "$env" ] || continue
+        conda_bundle_globs "$env"
+    done
 }
 
 apply_system() {
@@ -737,24 +846,26 @@ apply_system() {
     fi
 
     backup_file "$f" || { rm -f "$tmp"; record WARN "system" "$f" "no backup could be created"; return 1; }
-    if [ -w "$f" ]; then
-        cat "$tmp" > "$f" || { bad "failed to write $f"; rm -f "$tmp"; return 1; }
-    else
-        sudo cp "$tmp" "$f" || { bad "sudo failed for $f"; rm -f "$tmp"; return 1; }
-        sudo chmod 644 "$f" 2>/dev/null
-        sudo chown root:wheel "$f" 2>/dev/null
+    local bak="$LAST_BACKUP"
+    if ! install_file_atomic "$tmp" "$f"; then
+        bad "failed to write $f"
+        rm -f "$tmp"; record WARN "system" "$f" "write failed"; return 1
     fi
     rm -f "$tmp"
 
     # verify the write actually took effect before claiming success
     if [ -n "$(bundle_bad_roots "$f")" ]; then
         bad "$f still contains a compromised root after writing"
-        record WARN "system" "$f" "write did not take effect"
+        if [ -n "$bak" ]; then
+            install_file_atomic "$bak" "$f" && note "restored the original from $bak"
+        fi
+        record WARN "system" "$f" "write did not take effect, restored from backup"
         return 1
     fi
 
     ok "$f hardened ($before -> $(count_certs "$f") certificates)"
-    record FIXED "system" "$f" "removed $removed compromised roots"
+    note "original kept at $bak"
+    record FIXED "system" "$f" "removed $removed compromised roots (backup: $bak)"
 }
 
 apply_pip() {
@@ -865,14 +976,19 @@ conda_patch_env_bundle() {
         rm -f "$tmp"; return 0
     fi
     backup_file "$path" || { rm -f "$tmp"; return 1; }
-    cat "$tmp" > "$path" || { warn "  failed to write $path"; rm -f "$tmp"; return 1; }
+    local bak="$LAST_BACKUP"
+    if ! install_file_atomic "$tmp" "$path"; then
+        warn "  failed to write $path"; rm -f "$tmp"; return 1
+    fi
     rm -f "$tmp"
     if [ -n "$(bundle_bad_roots "$path")" ]; then
         warn "  $path still contains a compromised root after patching"
+        [ -n "$bak" ] && install_file_atomic "$bak" "$path" && note "  restored the original from $bak"
         return 1
     fi
     ok "  patched in place: $path (removed $removed)"
-    record FIXED "conda:$label" "$path" "patched in place, removed $removed root(s)"
+    note "  original kept at $bak"
+    record FIXED "conda:$label" "$path" "patched in place, removed $removed root(s) (backup: $bak)"
     return 0
 }
 
@@ -1033,6 +1149,75 @@ PYEOF
 }
 
 # -----------------------------------------------------------------------------
+# RESTORE
+# -----------------------------------------------------------------------------
+restore_all() {
+    hdr "Restoring trust stores from their backups"
+    note "/etc/ssl/cert.pem and every conda environment bundle are checked"
+
+    local f n=0 missing=0 failed=0
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        restore_file "$f"
+        case $? in
+            0) n=$((n + 1)) ;;
+            2) missing=$((missing + 1)) ;;
+            *) failed=$((failed + 1)) ;;
+        esac
+    done <<EOF
+$(all_bundle_paths)
+EOF
+
+    hdr "Summary"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '  would restore : %s\n' "$n"
+    else
+        printf '  restored : %s\n' "$n"
+    fi
+    [ "$missing" -gt 0 ] && printf '  no backup: %s\n' "$missing"
+    [ "$failed" -gt 0 ] && printf '  failed   : %s%s%s\n' "$C_RED" "$failed" "$C_RESET"
+
+    if [ "$failed" -gt 0 ]; then
+        exit 1
+    fi
+    if [ "$n" -eq 0 ]; then
+        printf '\nNothing to restore.\n'
+    elif [ "$DRY_RUN" -eq 1 ]; then
+        printf '\nRun again without --dry-run to restore.\n'
+    else
+        printf '\n%sRestored %d bundle(s).%s Open a new shell to pick them up.\n' "$C_GREEN" "$n" "$C_RESET"
+    fi
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# BACKUP - snapshot every trust store without changing anything
+# -----------------------------------------------------------------------------
+backup_all() {
+    hdr "Backing up trust stores"
+    local f n=0 failed=0
+    while IFS= read -r f; do
+        [ -n "$f" ] && [ -f "$f" ] || continue
+        if backup_file "$f"; then
+            n=$((n + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done <<EOF
+$(all_bundle_paths)
+EOF
+
+    hdr "Summary"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf '  would back up : %s\n' "$n"
+    else
+        printf '  backed up : %s\n' "$n"
+    fi
+    [ "$failed" -gt 0 ] && printf '  failed    : %s%s%s\n' "$C_RED" "$failed" "$C_RESET"
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
 main() {
@@ -1044,6 +1229,26 @@ main() {
     if [ -z "$PYTHON" ]; then
         warn "no python3 available - falling back to slow openssl scanning"
     fi
+
+    if [ "$ACTION" = "restore" ] || [ "$ACTION" = "backup" ]; then
+        if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+            if [ "$ACTION" = "restore" ]; then
+                printf 'This puts the newest backup of every trust store back in place.\n'
+                printf 'The current version of each file is backed up first.\n'
+            else
+                printf 'This copies every trust store to a .bak.<timestamp> file.\n'
+                printf 'Nothing else is changed.\n'
+            fi
+            printf 'Continue? [y/N] '
+            read -r reply
+            case "$reply" in
+                y|Y|yes|YES) ;;
+                *) printf 'Aborted.\n'; exit 2 ;;
+            esac
+        fi
+    fi
+    [ "$ACTION" = "restore" ] && restore_all
+    [ "$ACTION" = "backup" ] && backup_all
 
     if [ "$OFFLINE" -eq 1 ]; then
         note "offline mode: skipping live TLS probes"
