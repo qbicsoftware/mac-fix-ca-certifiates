@@ -246,18 +246,27 @@ the keychain and conda's certifi entirely: every JDK ships its own trust store
 (`lib/security/cacerts`) and its own blocklist, so a stock JDK still accepts the
 compromised chains even after the fixes above.
 
-Audit every JDK on the machine (system installers, SDKMAN, Homebrew, jenv, asdf,
-mise) with the bundled checker:
+Audit every JDK on the machine with the bundled checker:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
 bash emudhra-check.sh              # read-only audit
-bash emudhra-check.sh --inventory  # list JDKs and versions only
+bash emudhra-check.sh --inventory  # list JDKs and install sources only
 ```
 
-It prints one line per JDK — e.g. `AFFECTED 24 (OpenJDK) 12 of 12 compromised
-chains trusted` — and exits `1` when anything is affected. Then update each
-affected JDK to a fixed build:
+It finds every JDK (system installers, SDKMAN, Homebrew, jenv, asdf, mise), tests
+each one with a real TLS handshake against the disclosure hosts and, for every
+affected JDK, prints where it came from and the command that fixes it:
+
+```
+  AFFECTED    25.0.2    (OpenJDK) 12 of 12 compromised chains trusted
+             /Users/me/.sdkman/candidates/java/25.0.2-open
+             source: SDKMAN -> sdk install java 25.0.5.0.2-tem && sdk default java 25.0.5.0.2-tem
+```
+
+It exits `1` when anything is affected, so it can be used in scripts and CI.
+
+### The fixed build to move to
 
 | JDK | Fixed build |
 | --- | --- |
@@ -268,10 +277,64 @@ affected JDK to a fixed build:
 | 11 | 11.0.33.0.2 |
 | 8 | 8u511 |
 
-JDK 23 and 24 are end-of-life and will not get a fix — move to a patched LTS. If
-no patched build is available yet, `bash emudhra-check.sh --fix` appends the
-compromised intermediates to each affected JDK's `blocked.certs` as an interim
-measure (it makes a backup first).
+JDK 23 and 24 are end-of-life and will not receive a fix — move to a patched LTS
+(21 or 25). The fix keeps the roots and blocks the intermediates through
+`blocked.certs`, so **upgrading is preferred over deleting roots from `cacerts`**.
+
+### Updating, by installation source
+
+The checker names the source for each affected JDK. Match it to the section below;
+note that each JDK is updated on its own.
+
+**SDKMAN** — `~/.sdkman/candidates/java/...` (default vendor is Temurin):
+
+```bash
+sdk list java | grep '\.0\.2'        # confirm the fixed build is published
+sdk install java 21.0.13.0.2-tem
+sdk default java 21.0.13.0.2-tem
+```
+
+**Homebrew** — `/opt/homebrew/...` or `/usr/local/...`:
+
+```bash
+brew update
+brew upgrade openjdk@21              # or openjdk, openjdk@17, ...
+```
+
+On Apple Silicon these paths are symlinks; if the version does not change, run
+`brew reinstall openjdk@21`.
+
+**.pkg installer** — `/Library/Java/JavaVirtualMachines/...` (Oracle, Adoptium,
+Azul, …): download the fixed `.pkg` for that release family (from
+<https://adoptium.net/temurin/releases/> or your vendor) and install it. Pick
+`21.0.13.0.2`, **not** `21.0.13`. Verify with `/usr/libexec/java_home -V`.
+
+**Manual, jenv, asdf, mise, other** — install the fixed build and switch to it:
+
+```bash
+# jenv
+jenv add /path/to/fixed-jdk && jenv global 21.0.13.0.2
+
+# asdf / mise (check 'asdf list-all java' or 'mise ls-remote java' for the
+# exact identifier your plugin publishes)
+asdf install java temurin-21.0.13.0.2+9 && asdf global java temurin-21.0.13.0.2+9
+mise install java@temurin-21.0.13.0.2+9 && mise use -g java@temurin-21.0.13.0.2+9
+```
+
+### If no fixed build is available yet
+
+Vendor availability lags the advisory. Until your vendor publishes the fixed
+build, block the compromised intermediates in each JDK's own blocklist as an
+interim measure:
+
+```bash
+bash emudhra-check.sh --fix
+```
+
+It appends the compromised-intermediate fingerprints to every affected JDK's
+`blocked.certs` (Java 8: `jre/lib/security/blacklisted.certs`) and keeps a
+timestamped backup. Hand-added entries cover the 16 primary encodings only — the
+vendor fixed build blocks all 48 variants — so still upgrade once it lands.
 
 ## After running
 

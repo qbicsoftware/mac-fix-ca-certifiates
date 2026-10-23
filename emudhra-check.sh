@@ -3,9 +3,10 @@
 # emudhra-check.sh - Audit a macOS machine's JDKs against CVE-2026-91403
 #                   (compromised eMudhra intermediate CAs).
 #
-# Discovers every JDK it can find (system, user, SDKMAN, Homebrew, jenv,
-# asdf, mise, IntelliJ) and tests whether each one still accepts TLS
-# chains signed by the compromised intermediates.
+# Discovers every JDK it can find (system installers, SDKMAN, Homebrew, jenv,
+# asdf, mise) and tests whether each one still accepts TLS chains signed by the
+# compromised intermediates. For every affected JDK it also reports where that
+# JDK was installed from and the command that updates it.
 #
 # Usage:
 #   bash emudhra-check.sh              # audit only (default)
@@ -159,6 +160,53 @@ major_version() {
   esac
 }
 
+install_source() {
+  # Classifies where a JDK came from, from its path, so the report can name
+  # the right upgrade command. Echoes "<source>|<how to update>".
+  case "$1" in
+    "$HOME"/.sdkman/candidates/java/*)
+      printf '%s\n' "SDKMAN|sdk install java <fixed-build>-tem && sdk default java <fixed-build>-tem" ;;
+    /opt/homebrew/*|/usr/local/*)
+      if printf '%s' "$1" | grep -q '/Cellar/'; then
+        printf '%s\n' "Homebrew|brew upgrade <formula>"
+      else
+        printf '%s\n' "Homebrew|brew upgrade <formula>  (this path is a symlink; see notes)"
+      fi ;;
+    /Library/Java/JavaVirtualMachines/*)
+      printf '%s\n' ".pkg (system)|install the fixed .pkg from adoptium.net, then verify with /usr/libexec/java_home -V" ;;
+    "$HOME"/Library/Java/JavaVirtualMachines/*)
+      printf '%s\n' ".pkg (user)|install the fixed .pkg from adoptium.net, then verify with /usr/libexec/java_home -V" ;;
+    /opt/*|/usr/local/*|/usr/share/*)
+      printf '%s\n' "manual/tarball|replace the tarball with the fixed build (jdk.java.net / vendor)" ;;
+    *) printf '%s\n' "unknown|update this JDK to the fixed build for its release family" ;;
+  esac
+}
+
+homebrew_formula() {
+  # Best-effort formula name for a Homebrew JDK path.
+  case "$1" in
+    *openjdk@21*) printf 'openjdk@21\n' ;;
+    *openjdk@17*) printf 'openjdk@17\n' ;;
+    *openjdk@11*) printf 'openjdk@11\n' ;;
+    *openjdk@8*)  printf 'openjdk@8\n' ;;
+    *openjdk*)    printf 'openjdk\n' ;;
+    *)            printf 'openjdk\n' ;;
+  esac
+}
+
+fixed_build_for_major() {
+  # Fixed eMudhra/CVE-2026-91403 build per release family ("" if EOL family).
+  case "$1" in
+    27) printf '27.0.1.0.2\n' ;;
+    25) printf '25.0.5.0.2\n' ;;
+    21) printf '21.0.13.0.2\n' ;;
+    17) printf '17.0.21.0.2\n' ;;
+    11) printf '11.0.33.0.2\n' ;;
+    8)  printf '8u511\n' ;;
+    *)  printf '\n' ;;
+  esac
+}
+
 run_check() {
   home=$1 major=$2 out=$3
   if [ "$major" -ge 11 ] 2>/dev/null; then
@@ -210,8 +258,21 @@ while IFS= read -r home; do
     | head -1)
   [ -n "$vendor" ] || vendor="OpenJDK"
 
+  source_line=$(install_source "$home")
+  isource=${source_line%%|*}
+  iupdate=${source_line#*|}
+  # Resolve the concrete fixed build and Homebrew formula so the command shown
+  # is copy-pasteable.
+  fixed=$(fixed_build_for_major "$major")
+  if [ -n "$fixed" ]; then
+    iupdate=$(printf '%s' "$iupdate" | sed "s|<fixed-build>|$fixed|g")
+  fi
+  case "$isource" in
+    Homebrew*) iupdate=$(printf '%s' "$iupdate" | sed "s|<formula>|$(homebrew_formula "$home")|") ;;
+  esac
+
   if [ "$MODE" = inventory ]; then
-    printf '%s\n' "$ver|$raw|$home" >> "$RESULTS"
+    printf '%s\n' "$ver|$raw|$home|$isource" >> "$RESULTS"
     continue
   fi
 
@@ -238,7 +299,7 @@ while IFS= read -r home; do
     *)        UNKNOWN=$((UNKNOWN + 1)) ;;
   esac
 
-  printf '%s|%s|%s|%s|%s\n' "$status" "$ver" "$vendor" "$home" "$detail" >> "$RESULTS"
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$status" "$ver" "$vendor" "$home" "$detail" "$isource" "$iupdate" >> "$RESULTS"
 
   # Optional interim mitigation
   if [ "$MODE" = fix ] && [ "$status" = AFFECTED ]; then
@@ -259,11 +320,11 @@ if [ "$MODE" = json ]; then
   printf '{"host":"%s","user":"%s","total":%d,"affected":%d,"patched":%d,"unknown":%d,"jdks":[' \
     "$(hostname)" "$(id -un)" "$TOTAL" "$AFFECTED" "$PATCHED" "$UNKNOWN"
   first=1
-  while IFS='|' read -r status ver vendor home detail; do
+  while IFS='|' read -r status ver vendor home detail isource iupdate; do
     [ "$first" = 1 ] || printf ','
     first=0
-    printf '{"status":"%s","version":"%s","vendor":"%s","home":"%s","detail":"%s"}' \
-      "$status" "$ver" "$vendor" "$home" "$detail"
+    printf '{"status":"%s","version":"%s","vendor":"%s","source":"%s","home":"%s","detail":"%s"}' \
+      "$status" "$ver" "$vendor" "$isource" "$home" "$detail"
   done < "$RESULTS"
   printf ']}\n'
   [ "$AFFECTED" -eq 0 ] && exit 0 || exit 1
@@ -272,8 +333,8 @@ fi
 if [ "$MODE" = inventory ]; then
   say "${C_BOLD}Discovered JDKs${C_RESET}"
   say ""
-  while IFS='|' read -r ver raw home; do
-    printf '  %-10s %s\n             %s\n' "$ver" "$raw" "$home"
+  while IFS='|' read -r ver raw home isource; do
+    printf '  %-10s %-9s %s\n             %s\n' "$ver" "($isource)" "$raw" "$home"
   done < "$RESULTS"
   say ""
   say "Total: $TOTAL"
@@ -283,22 +344,26 @@ fi
 say ""
 say "${C_BOLD}Results${C_RESET}"
 say ""
-while IFS='|' read -r status ver vendor home detail; do
+while IFS='|' read -r status ver vendor home detail isource iupdate; do
   case "$status" in
     AFFECTED) col=$C_RED ;;
     PATCHED)  col=$C_GREEN ;;
     *)        col=$C_YELLOW ;;
   esac
-  printf '  %s%-10s%s  %-9s (%-10s) %s\n' "$col" "$status" "$C_RESET" "$ver" "$vendor" "$detail"
+  printf '  %s%-10s%s  %-9s (%s) %s\n' "$col" "$status" "$C_RESET" "$ver" "$vendor" "$detail"
   printf '             %s\n' "$home"
+  if [ "$status" = AFFECTED ]; then
+    printf '             %ssource: %s -> %s%s\n' "$C_BOLD" "$isource" "$iupdate" "$C_RESET"
+  fi
 done < "$RESULTS"
 say ""
 say "  ${C_BOLD}Total:${C_RESET} $TOTAL   ${C_RED}Affected: $AFFECTED${C_RESET}   ${C_GREEN}Patched: $PATCHED${C_RESET}   ${C_YELLOW}Unknown: $UNKNOWN${C_RESET}"
 say ""
 
 if [ "$AFFECTED" -gt 0 ]; then
-  say "  ${C_RED}Action required.${C_RESET} Update each AFFECTED JDK to a fixed build:"
-  say "    27.0.1.0.2 / 25.0.5.0.2 / 21.0.13.0.2 / 17.0.21.0.2 / 11.0.33.0.2 / 8u511"
+  say "  ${C_RED}Action required.${C_RESET} The per-JDK update command is shown next to each"
+  say "  AFFECTED entry above. Fixed builds: 27.0.1.0.2 / 25.0.5.0.2 / 21.0.13.0.2 /"
+  say "  17.0.21.0.2 / 11.0.33.0.2 / 8u511."
   say "  The fix keeps the roots and blocks the intermediates via blocked.certs,"
   say "  so upgrading is preferred over deleting roots from cacerts."
   say ""
