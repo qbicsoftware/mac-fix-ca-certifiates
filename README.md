@@ -17,6 +17,15 @@
 > ```bash
 > ./fix-certificates.sh apply
 > ```
+>
+> **Check java as well:**
+> 
+> Audit every JDK on the machine with the bundled checker:
+> 
+> ```bash
+> curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
+> bash emudhra-check.sh              # read-only audit
+> ```
 
 **Prefer to read the code before running it?**
 
@@ -251,6 +260,9 @@ Audit every JDK on the machine with the bundled checker:
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
 bash emudhra-check.sh              # read-only audit
+```
+
+```bash
 bash emudhra-check.sh --inventory  # list JDKs and install sources only
 ```
 
