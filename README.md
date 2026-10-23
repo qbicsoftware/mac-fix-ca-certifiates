@@ -294,20 +294,24 @@ sdk install java 21.0.13.0.2-tem
 sdk default java 21.0.13.0.2-tem
 ```
 
-**Homebrew** — `/opt/homebrew/...` or `/usr/local/...`:
+**Homebrew** — `/opt/homebrew/...` or `/usr/local/...` for formulae, or a
+`/Library/Java/JavaVirtualMachines/jdk-21.jdk` installed by a cask:
 
 ```bash
 brew update
-brew upgrade openjdk@21              # or openjdk, openjdk@17, ...
+brew upgrade openjdk@21              # formula: openjdk, openjdk@17, ...
+brew upgrade --cask oracle-jdk@21    # cask: oracle-jdk@21, microsoft-openjdk, zulu, corretto, temurin
 ```
 
 On Apple Silicon these paths are symlinks; if the version does not change, run
-`brew reinstall openjdk@21`.
+`brew reinstall <formula>` or `brew reinstall --cask <cask>`.
 
-**.pkg installer** — `/Library/Java/JavaVirtualMachines/...` (Oracle, Adoptium,
-Azul, …): download the fixed `.pkg` for that release family (from
-<https://adoptium.net/temurin/releases/> or your vendor) and install it. Pick
-`21.0.13.0.2`, **not** `21.0.13`. Verify with `/usr/libexec/java_home -V`.
+**Manual `.pkg`** — `/Library/Java/JavaVirtualMachines/...` (Oracle, Microsoft,
+Adoptium, Azul, …): download the fixed `.pkg` from **your vendor** (Oracle from
+oracle.com, Microsoft from <https://aka.ms/download-jdk>, Adoptium from
+<https://adoptium.net/temurin/releases/>) and install it. Pick the `.0.2` build
+(`21.0.13.0.2`), **not** the plain `21.0.13`. Verify with
+`/usr/libexec/java_home -V`.
 
 **Manual, jenv, asdf, mise, other** — install the fixed build and switch to it:
 

@@ -160,26 +160,107 @@ major_version() {
   esac
 }
 
-install_source() {
-  # Classifies where a JDK came from, from its path, so the report can name
-  # the right upgrade command. Echoes "<source>|<how to update>".
+# --- Homebrew cask awareness ---------------------------------------------------
+# oracle-jdk@21, microsoft-openjdk, temurin, zulu, corretto … install into
+# /Library/Java/JavaVirtualMachines as a .pkg, so the path alone cannot tell
+# them apart from a manual .pkg install. Ask Homebrew.
+BREW_CASKS=""
+BREW_CASKS_READY=0
+brew_casks() {
+  [ "$BREW_CASKS_READY" = 1 ] || {
+    BREW_CASKS_READY=1
+    if command -v brew >/dev/null 2>&1; then
+      BREW_CASKS="$(brew list --cask 2>/dev/null)"
+    fi
+  }
+  printf '%s\n' "$BREW_CASKS"
+}
+
+bundle_name() {
+  # /Library/.../jdk-21.jdk/Contents/Home -> jdk-21.jdk
+  basename "$(printf '%s' "$1" | sed 's|/Contents/Home$||')"
+}
+
+cask_from_bundle() {
+  # Map an installed bundle directory to its Homebrew cask token.
   case "$1" in
+    jdk-21*|jdk-21.jdk) printf 'oracle-jdk@21\n' ;;
+    jdk-17*|jdk-17.jdk) printf 'oracle-jdk@17\n' ;;
+    jdk-*)              printf 'oracle-jdk\n' ;;
+    ms-*)               printf 'microsoft-openjdk\n' ;;
+    temurin-*)          printf 'temurin\n' ;;
+    zulu-*)             printf 'zulu\n' ;;
+    corretto-*)         printf 'corretto\n' ;;
+    liberica-*)         printf 'liberica-jdk\n' ;;
+    *)                  printf '\n' ;;
+  esac
+}
+
+vendor_of() {
+  # Vendor from the whole `java -version` output.
+  case "$1" in
+    *Temurin*|*"Eclipse Adoptium"*) printf 'Eclipse Temurin\n' ;;
+    *Zulu*)                         printf 'Azul Zulu\n' ;;
+    *Corretto*)                     printf 'Amazon Corretto\n' ;;
+    *Liberica*)                     printf 'BellSoft Liberica\n' ;;
+    *GraalVM*)                      printf 'GraalVM\n' ;;
+    *Microsoft*)                    printf 'Microsoft Build of OpenJDK\n' ;;
+    *"Java(TM) SE"*)                printf 'Oracle JDK\n' ;;
+    *)                              printf 'OpenJDK\n' ;;
+  esac
+}
+
+vendor_url() {
+  case "$1" in
+    *Oracle*)    printf 'https://www.oracle.com/java/technologies/downloads/' ;;
+    *Microsoft*) printf 'https://aka.ms/download-jdk' ;;
+    *Zulu*)      printf 'https://www.azul.com/downloads/' ;;
+    *Corretto*)  printf 'https://aws.amazon.com/corretto/' ;;
+    *Liberica*)  printf 'https://bell-sw.com/pages/downloads/' ;;
+    *)           printf 'https://adoptium.net/temurin/releases/' ;;
+  esac
+}
+
+install_source() {  # <home> <vendor-name>
+  # Echoes "<source>|<how to update>".
+  local home="$1" vendor="$2" bundle cask
+
+  case "$home" in
     "$HOME"/.sdkman/candidates/java/*)
-      printf '%s\n' "SDKMAN|sdk install java <fixed-build>-tem && sdk default java <fixed-build>-tem" ;;
+      printf '%s\n' "SDKMAN|sdk install java <fixed-build>-tem && sdk default java <fixed-build>-tem"
+      return ;;
+  esac
+
+  case "$home" in
     /opt/homebrew/*|/usr/local/*)
-      if printf '%s' "$1" | grep -q '/Cellar/'; then
+      if printf '%s' "$home" | grep -q '/Cellar/'; then
         printf '%s\n' "Homebrew|brew upgrade <formula>"
       else
-        printf '%s\n' "Homebrew|brew upgrade <formula>  (this path is a symlink; see notes)"
-      fi ;;
-    /Library/Java/JavaVirtualMachines/*)
-      printf '%s\n' ".pkg (system)|install the fixed .pkg from adoptium.net, then verify with /usr/libexec/java_home -V" ;;
-    "$HOME"/Library/Java/JavaVirtualMachines/*)
-      printf '%s\n' ".pkg (user)|install the fixed .pkg from adoptium.net, then verify with /usr/libexec/java_home -V" ;;
-    /opt/*|/usr/local/*|/usr/share/*)
-      printf '%s\n' "manual/tarball|replace the tarball with the fixed build (jdk.java.net / vendor)" ;;
-    *) printf '%s\n' "unknown|update this JDK to the fixed build for its release family" ;;
+        printf '%s\n' "Homebrew|brew upgrade <formula>  (or: brew reinstall <formula>)"
+      fi
+      return ;;
   esac
+
+  # JavaVirtualMachines: a Homebrew cask, a manual .pkg, or a tarball
+  case "$home" in
+    /Library/Java/*|"$HOME"/Library/Java/*)
+      bundle="$(bundle_name "$home")"
+      cask="$(cask_from_bundle "$bundle")"
+      if [ -n "$cask" ] && brew_casks | grep -qx "$cask"; then
+        printf '%s\n' "Homebrew cask|brew upgrade --cask $cask"
+        return
+      fi
+      printf '%s\n' ".pkg ($vendor)|install the $vendor <fixed-build> .pkg ($(vendor_url "$vendor")), then /usr/libexec/java_home -V"
+      return ;;
+  esac
+
+  case "$home" in
+    /opt/*|/usr/share/*)
+      printf '%s\n' "manual/tarball|replace the tarball with the fixed build (jdk.java.net / vendor)"
+      return ;;
+  esac
+
+  printf '%s\n' "unknown|update this JDK to the fixed build for its release family"
 }
 
 homebrew_formula() {
@@ -253,12 +334,9 @@ while IFS= read -r home; do
   [ -n "$ver" ] || ver="?"
   major=$(major_version "$raw")
   [ -n "$major" ] || major=0
-  vendor=$(printf '%s' "$allver" \
-    | sed -n 's/.*\(Temurin\|Zulu\|Corretto\|Liberica\|GraalVM\|Semeru\|OpenJ9\|Java(TM)\).*/\1/p' \
-    | head -1)
-  [ -n "$vendor" ] || vendor="OpenJDK"
+  vendor=$(vendor_of "$allver")
 
-  source_line=$(install_source "$home")
+  source_line=$(install_source "$home" "$vendor")
   isource=${source_line%%|*}
   iupdate=${source_line#*|}
   # Resolve the concrete fixed build and Homebrew formula so the command shown
