@@ -345,10 +345,19 @@ It appends the compromised-intermediate fingerprints to every affected JDK's
 `blocked.certs` (Java 8: `jre/lib/security/blacklisted.certs`) and keeps a
 timestamped backup. For JDKs under `/Library/Java/...` (system `.pkg` and cask
 installs) it needs write access, so run it as `sudo bash emudhra-check.sh --fix`
-if it reports the file is not writable. Hand-added entries cover the 16 primary
-encodings only — the vendor fixed build blocks all 48 variants — so still
-upgrade once it lands, then re-run the audit: a patched build reports `PATCHED`
-even though the blocklist entries remain.
+if it reports the file is not writable.
+
+`--fix` re-tests each JDK after blocking it and reports `MITIGATED` for any that
+now reject the chains, so you can see the change took effect:
+
+```
+  MITIGATED   21.0.12.1 (Oracle JDK) blocked via blocked.certs (interim; upgrade still recommended)
+```
+
+Confirm with a plain run afterwards (a fresh shell avoids any JVM that was
+started before the change) — a JDK with only the blocklist shows `PATCHED`. The
+interim entries cover the 16 primary encodings, whereas the vendor fixed build
+covers all 48 variants, so still upgrade once it lands.
 
 ## After running
 

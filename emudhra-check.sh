@@ -12,11 +12,13 @@
 #   bash emudhra-check.sh              # audit only (default)
 #   bash emudhra-check.sh --inventory  # list JDKs + versions, skip network test
 #   bash emudhra-check.sh --fix        # audit, then append interim blocklist
-#                                      # entries to affected JDKs (makes backups)
+#                                      # entries to affected JDKs (makes backups,
+#                                      # re-tests, reports MITIGATED)
 #   bash emudhra-check.sh --json       # machine-readable result on stdout
 #
 # Exit codes:
-#   0 = no affected JDK found     1 = at least one affected JDK
+#   0 = no affected JDK found (or all were mitigated by --fix)
+#   1 = at least one affected JDK
 #   2 = nothing to test / error   3 = audited but results inconclusive
 #
 # Test hosts belong to the public disclosure site emudhra.we-have-a-problem.com
@@ -372,7 +374,7 @@ for x in json.load(open('$TMPD/impacted.json')):
 #---------------------------------------------------------------------------
 # Main loop
 #---------------------------------------------------------------------------
-TOTAL=0 AFFECTED=0 PATCHED=0 UNKNOWN=0
+TOTAL=0 AFFECTED=0 PATCHED=0 UNKNOWN=0 MITIGATED=0
 
 say ""
 say "${C_BOLD}JDK audit for CVE-2026-91403 (compromised eMudhra intermediates)${C_RESET}"
@@ -426,30 +428,46 @@ while IFS= read -r home; do
     fi
   fi
 
-  case "$status" in
-    AFFECTED) AFFECTED=$((AFFECTED + 1)) ;;
-    PATCHED)  PATCHED=$((PATCHED + 1)) ;;
-    *)        UNKNOWN=$((UNKNOWN + 1)) ;;
-  esac
-
-  printf '%s|%s|%s|%s|%s|%s|%s\n' "$status" "$ver" "$vendor" "$home" "$detail" "$isource" "$iupdate" >> "$RESULTS"
-
-  # Optional interim mitigation
+  # Interim mitigation with re-verification: block the intermediates, then
+  # test again. A JDK that now rejects the chains is reported as MITIGATED.
   if [ "$MODE" = fix ] && [ "$status" = AFFECTED ]; then
     if [ -s "$TMPD/impacted.json" ]; then
-      mitigate_jdk "$home"
+      if mitigate_jdk "$home"; then
+        note "  re-testing $ver ..."
+        if run_check "$home" "$major" "$TMPD/out2"; then
+          cv2=$(printf '%s' "$(grep '^COUNTS ' "$TMPD/out2" | tail -1)" \
+                | sed -n 's/.*vuln=\([0-9]*\).*/\1/p'); cv2=${cv2:-0}
+          co2=$(printf '%s' "$(grep '^COUNTS ' "$TMPD/out2" | tail -1)" \
+                | sed -n 's/.*ok=\([0-9]*\).*/\1/p'); co2=${co2:-0}
+          if [ "${cv2:-0}" -eq 0 ] && [ "${co2:-0}" -gt 0 ]; then
+            status=MITIGATED
+            detail="blocked via blocked.certs (interim; upgrade still recommended)"
+          else
+            detail="$detail (mitigation did not take effect)"
+          fi
+        fi
+      fi
     else
       note "  --fix: no fingerprint list; mitigation skipped"
     fi
   fi
+
+  case "$status" in
+    AFFECTED)  AFFECTED=$((AFFECTED + 1)) ;;
+    PATCHED)   PATCHED=$((PATCHED + 1)) ;;
+    MITIGATED) MITIGATED=$((MITIGATED + 1)) ;;
+    *)         UNKNOWN=$((UNKNOWN + 1)) ;;
+  esac
+
+  printf '%s|%s|%s|%s|%s|%s|%s\n' "$status" "$ver" "$vendor" "$home" "$detail" "$isource" "$iupdate" >> "$RESULTS"
 done < "$CANDIDATES"
 
 #---------------------------------------------------------------------------
 # Report
 #---------------------------------------------------------------------------
 if [ "$MODE" = json ]; then
-  printf '{"host":"%s","user":"%s","total":%d,"affected":%d,"patched":%d,"unknown":%d,"jdks":[' \
-    "$(hostname)" "$(id -un)" "$TOTAL" "$AFFECTED" "$PATCHED" "$UNKNOWN"
+  printf '{"host":"%s","user":"%s","total":%d,"affected":%d,"patched":%d,"mitigated":%d,"unknown":%d,"jdks":[' \
+    "$(hostname)" "$(id -un)" "$TOTAL" "$AFFECTED" "$PATCHED" "$MITIGATED" "$UNKNOWN"
   first=1
   while IFS='|' read -r status ver vendor home detail isource iupdate; do
     [ "$first" = 1 ] || printf ','
@@ -477,9 +495,10 @@ say "${C_BOLD}Results${C_RESET}"
 say ""
 while IFS='|' read -r status ver vendor home detail isource iupdate; do
   case "$status" in
-    AFFECTED) col=$C_RED ;;
-    PATCHED)  col=$C_GREEN ;;
-    *)        col=$C_YELLOW ;;
+    AFFECTED)  col=$C_RED ;;
+    PATCHED)   col=$C_GREEN ;;
+    MITIGATED) col=$C_GREEN ;;
+    *)         col=$C_YELLOW ;;
   esac
   printf '  %s%-10s%s  %-9s (%s) %s\n' "$col" "$status" "$C_RESET" "$ver" "$vendor" "$detail"
   printf '             %s\n' "$home"
@@ -488,7 +507,7 @@ while IFS='|' read -r status ver vendor home detail isource iupdate; do
   fi
 done < "$RESULTS"
 say ""
-say "  ${C_BOLD}Total:${C_RESET} $TOTAL   ${C_RED}Affected: $AFFECTED${C_RESET}   ${C_GREEN}Patched: $PATCHED${C_RESET}   ${C_YELLOW}Unknown: $UNKNOWN${C_RESET}"
+say "  ${C_BOLD}Total:${C_RESET} $TOTAL   ${C_RED}Affected: $AFFECTED${C_RESET}   ${C_GREEN}Patched: $PATCHED${C_RESET}   ${C_GREEN}Mitigated: $MITIGATED${C_RESET}   ${C_YELLOW}Unknown: $UNKNOWN${C_RESET}"
 say ""
 
 if [ "$AFFECTED" -gt 0 ]; then
@@ -499,6 +518,13 @@ if [ "$AFFECTED" -gt 0 ]; then
   say "  so upgrading is preferred over deleting roots from cacerts."
   say ""
   exit 1
+fi
+
+if [ "$MITIGATED" -gt 0 ]; then
+  say "  ${C_GREEN}All affected JDKs are now blocked.${C_RESET} Re-run without --fix to confirm"
+  say "  on a fresh shell, and still upgrade to a fixed build when your vendor ships it."
+  say ""
+  exit 0
 fi
 
 if [ "$UNKNOWN" -gt 0 ] && [ "$PATCHED" -eq 0 ]; then
