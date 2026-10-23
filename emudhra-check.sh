@@ -16,6 +16,10 @@
 #                                      # re-tests, reports MITIGATED)
 #   bash emudhra-check.sh --json       # machine-readable result on stdout
 #
+# Re-download the latest copy before relying on the result:
+#   https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
+# The version is printed by --help and at the top of every run.
+#
 # Exit codes:
 #   0 = nothing vulnerable (a JDK protected only by the interim blocklist is
 #       reported as MITIGATED, still exit 0, with an upgrade reminder)
@@ -31,6 +35,11 @@
 #
 set -u
 
+# Bump on every change. Shown by --help and at the top of every run so a stale
+# local copy is obvious; re-download from
+#   https://raw.githubusercontent.com/qbicsoftware/mac-fix-ca-certifiates/main/emudhra-check.sh
+VERSION="1.3"
+
 #---------------------------------------------------------------------------
 # Options
 #---------------------------------------------------------------------------
@@ -40,7 +49,7 @@ for arg in "$@"; do
     --inventory) MODE=inventory ;;
     --fix)       MODE=fix ;;
     --json)      MODE=json ;;
-    -h|--help)   sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)   printf 'emudhra-check.sh (version %s)\n\n' "$VERSION"; sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -404,7 +413,7 @@ TOTAL=0 AFFECTED=0 PATCHED=0 UNKNOWN=0 MITIGATED=0
 
 say ""
 say "${C_BOLD}JDK audit for CVE-2026-91403 (compromised eMudhra intermediates)${C_RESET}"
-say "Machine: $(hostname)   User: $(id -un)"
+say "emudhra-check.sh $VERSION   Machine: $(hostname)   User: $(id -un)"
 say ""
 
 while IFS= read -r home; do

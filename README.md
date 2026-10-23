@@ -266,6 +266,10 @@ affected JDK, prints where it came from and the command that fixes it:
 
 It exits `1` when anything is affected, so it can be used in scripts and CI.
 
+> **Use the latest copy.** The script prints its version (`emudhra-check.sh 1.3`)
+> at the top of every run and via `--help`. If yours does not, re-download it —
+> an older copy misreports the state after `--fix` (see below).
+
 ### The fixed build to move to
 
 | JDK | Fixed build |
